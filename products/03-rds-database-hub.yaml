@@ -1,1 +1,453 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DIU Managed Infrastructure Platform - Virtual Server (EC2).
+  Deploys a single virtual server (Linux or Windows) into a pre-existing VPC.
+  OS, size, and disk are chosen by the user in MPP. Network placement and
+  cost-centre tagging are injected by the provisioning Lambda from SSM. This is a test.
+
+# ── Parameters ─────────────────────────────────────────────────────────────────
+
+Parameters:
+
+  # ── Injected by Lambda from SSM ─────────────────────────────────────────────
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Pre-existing VPC. Injected by Lambda from SSM.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet within the VPC. Injected by Lambda from SSM.
+
+  CustomerID:
+    Type: String
+    Description: Unique customer identifier. Used for naming and tagging.
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Lowercase letters, numbers, and hyphens only.
+
+  CostCenter:
+    Type: String
+    Description: Cost center code for billing attribution. Applied as a tag to all resources.
+    MinLength: 1
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, prod]
+    Description: Deployment environment.
+
+  # ── From MPP order form ──────────────────────────────────────────────────────
+
+  servername:
+    Type: String
+    Description: >
+      Hostname for the server. Used as the EC2 Name tag and set as the OS
+      hostname via UserData. Lowercase letters, numbers, and hyphens only.
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*$
+    ConstraintDescription: Must start with a letter or number. Lowercase letters, numbers, and hyphens only.
+
+  OperatingSystem:
+    Type: String
+    Description: Operating system to install.
+    AllowedValues:
+      - 1_amazon_linux_2023
+      - 2_ubuntu_2404
+      - 3_windows_2022
+    Default: 1_amazon_linux_2023
+
+  size:
+    Type: String
+    Description: "Server size: S = t3.medium (2 vCPU / 4 GB), M = t3.xlarge (4 vCPU / 16 GB), L = t3.2xlarge (8 vCPU / 32 GB)."
+    AllowedValues:
+      - 1-small
+      - 2-medium
+      - 3-large
+    Default: 1-small
+
+  DiskSizeGb:
+    Type: Number
+    Description: Root volume size in gigabytes. Between 20 and 500.
+    MinValue: 20
+    MaxValue: 500
+    Default: 50
+
+  AccessType:
+    Type: String
+    Description: >
+      Access type. 1_internal restricts SSH/RDP to the private VPN range (10.0.0.0/8).
+      2_public opens SSH/RDP to the IpWhitelist CIDR.
+    AllowedValues:
+      - 1_internal
+      - 2_public
+    Default: 1_internal
+
+  IpWhitelist:
+    Type: String
+    Description: >
+      CIDR range allowed for SSH (Linux) or RDP (Windows). Required when
+      AccessType = 2_public. Leave empty for internal-only access.
+    Default: ""
+
+  SshPublicKey:
+    Type: String
+    Description: >
+      SSH public key for Linux servers (e.g. "ssh-ed25519 AAAA...").
+      Not required for Windows. Leave empty to rely on SSM Session Manager only.
+    Default: ""
+
+  # ── AMI lookups — resolved at deploy time from AWS-managed SSM paths ─────────
+  # These are not exposed in MPP. The defaults always resolve to the latest
+  # patched AMI, so no manual AMI ID management is needed.
+
+  AmiAl2023:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI, resolved at deploy time.
+
+  AmiUbuntu2404:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Latest Ubuntu 24.04 LTS x86_64 AMI, resolved at deploy time.
+
+  AmiWindows2022:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+    Description: Latest Windows Server 2022 Full Base AMI, resolved at deploy time.
+
+# ── Mappings ───────────────────────────────────────────────────────────────────
+# Instance type per size selection. All sizing decisions live here.
+
+Mappings:
+  SizeConfig:
+    1-small:
+      InstanceType: t3.medium     # 2 vCPU, 4 GB RAM
+    2-medium:
+      InstanceType: t3.xlarge     # 4 vCPU, 16 GB RAM
+    3-large:
+      InstanceType: t3.2xlarge    # 8 vCPU, 32 GB RAM
+
+# ── Conditions ─────────────────────────────────────────────────────────────────
+
+Conditions:
+
+  IsWindows:      !Equals [!Ref OperatingSystem, "3_windows_2022"]
+  IsLinux:        !Not [!Equals [!Ref OperatingSystem, "3_windows_2022"]]
+  IsAL2023:       !Equals [!Ref OperatingSystem, "1_amazon_linux_2023"]
+  IsPublicAccess: !Equals [!Ref AccessType, "2_public"]
+
+  HasSshKey:
+    !Not [!Equals [!Ref SshPublicKey, ""]]
+
+  # Key pair is only created when the server is Linux AND an SSH key was provided.
+  CreateKeyPair:
+    Fn::And:
+      - Condition: IsLinux
+      - Condition: HasSshKey
+
+# ── Resources ──────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── SSH Key Pair (Linux + SSH key provided only) ────────────────────────────
+  # AWS stores only the public half. The customer retains exclusive control of
+  # the private key. Not created for Windows or when no key is supplied.
+
+  ServerKeyPair:
+    Type: AWS::EC2::KeyPair
+    Condition: CreateKeyPair
+    Properties:
+      KeyName: !Sub diu-key-${CustomerID}-${AWS::StackName}
+      PublicKeyMaterial: !Ref SshPublicKey
+      Tags:
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Security Group ──────────────────────────────────────────────────────────
+  # Base group allows HTTP/HTTPS from anywhere (it's a web server).
+  # SSH and RDP rules are added as separate resources so they can be
+  # conditional (SSH for Linux, RDP for Windows).
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Security group for ${servername} (${CustomerID})
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from anywhere
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic permitted
+      Tags:
+        - Key: Name
+          Value: !Sub diu-sg-${servername}
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # SSH on port 22 — Linux only.
+  SshIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsLinux
+    Properties:
+      GroupId: !GetAtt WebServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !If [IsPublicAccess, !Ref IpWhitelist, "10.0.0.0/8"]
+      Description: !If
+        - IsPublicAccess
+        - !Sub SSH from ${IpWhitelist}
+        - SSH from VPN (10.0.0.0/8)
+
+  # RDP on port 3389 — Windows only.
+  RdpIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsWindows
+    Properties:
+      GroupId: !GetAtt WebServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3389
+      ToPort: 3389
+      CidrIp: !If [IsPublicAccess, !Ref IpWhitelist, "10.0.0.0/8"]
+      Description: !If
+        - IsPublicAccess
+        - !Sub RDP from ${IpWhitelist}
+        - RDP from VPN (10.0.0.0/8)
+
+  # ── IAM Role for EC2 Instance ──────────────────────────────────────────────
+  # Grants the instance permission to communicate with AWS Systems Manager.
+  # Enables Session Manager (browser-based terminal access) and patch
+  # management without requiring additional inbound firewall rules.
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: ManagedBy
+          Value: cloudformation
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ── EC2 Instance ────────────────────────────────────────────────────────────
+  # Security hardening:
+  #   - IMDSv2 required (HttpTokens: required) — prevents SSRF metadata attacks
+  #   - EBS volume encrypted at rest
+  #   - Public IP only assigned when AccessType = 2_public
+  #   - AMI resolved at deploy time (no stale hardcoded AMI IDs)
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !FindInMap [SizeConfig, !Ref size, InstanceType]
+      ImageId: !If
+        - IsAL2023
+        - !Ref AmiAl2023
+        - !If
+          - IsWindows
+          - !Ref AmiWindows2022
+          - !Ref AmiUbuntu2404
+      KeyName: !If [CreateKeyPair, !Ref ServerKeyPair, !Ref AWS::NoValue]
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+          AssociatePublicIpAddress: !If [IsPublicAccess, true, false]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: enabled
+      BlockDeviceMappings:
+        - DeviceName: !If [IsWindows, "/dev/sda1", "/dev/xvda"]
+          Ebs:
+            VolumeSize: !Ref DiskSizeGb
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        !If
+          - IsWindows
+          # ── Windows UserData (PowerShell) ──────────────────────────────────
+          # Uses Fn::Join to safely embed CF parameter values without conflicting
+          # with PowerShell's own variable syntax.
+          - Fn::Base64:
+              Fn::Join:
+                - ""
+                - - "<powershell>\n"
+                  - "Rename-Computer -NewName '"
+                  - !Ref servername
+                  - "' -Force -ErrorAction SilentlyContinue\n"
+                  - "Install-WindowsFeature -Name Web-Server -IncludeManagementTools\n"
+                  - "$html = '<!DOCTYPE html><html><head><title>DIU Managed Server</title></head>"
+                  - "<body><h1>DIU Managed Infrastructure</h1>"
+                  - "<p>Customer: "
+                  - !Ref CustomerID
+                  - "</p><p>Server: "
+                  - !Ref servername
+                  - "</p><p>Environment: "
+                  - !Ref Environment
+                  - "</p></body></html>'\n"
+                  - "Set-Content -Path 'C:\\inetpub\\wwwroot\\index.html' -Value $html -Encoding UTF8\n"
+                  - "cfn-signal.exe -e $LASTEXITCODE --stack '"
+                  - !Ref AWS::StackName
+                  - "' --region '"
+                  - !Ref AWS::Region
+                  - "' --resource WebServer\n"
+                  - "</powershell>"
+          # ── Linux UserData (Bash — Amazon Linux 2023 and Ubuntu) ───────────
+          # Detects the package manager to handle AL2023 (dnf) vs Ubuntu (apt).
+          # CloudFormation substitutes ${ParameterName} before the script runs,
+          # so the heredoc contains literal values at runtime.
+          - Fn::Base64: !Sub |
+              #!/bin/bash
+              set -euo pipefail
+
+              # Set hostname
+              hostnamectl set-hostname ${servername}
+
+              # Install NGINX — AL2023 uses dnf, Ubuntu uses apt
+              if command -v apt-get &>/dev/null; then
+                apt-get update -y
+                apt-get install -y nginx
+                NGINX_ROOT=/var/www/html
+              else
+                dnf update -y
+                dnf install -y nginx
+                NGINX_ROOT=/usr/share/nginx/html
+              fi
+
+              systemctl enable nginx
+              systemctl start nginx
+
+              # Write status page
+              cat > "$NGINX_ROOT/index.html" <<'STATUSEOF'
+              <!DOCTYPE html>
+              <html>
+                <head><title>DIU Managed Server</title></head>
+                <body>
+                  <h1>DIU Managed Infrastructure</h1>
+                  <p>Customer: ${CustomerID}</p>
+                  <p>Server: ${servername}</p>
+                  <p>OS: ${OperatingSystem}</p>
+                  <p>Environment: ${Environment}</p>
+                </body>
+              </html>
+              STATUSEOF
+
+              # Signal CloudFormation that setup is complete
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource WebServer || true
+      Tags:
+        - Key: Name
+          Value: !Ref servername
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: Servername
+          Value: !Ref servername
+        - Key: OS
+          Value: !Ref OperatingSystem
+        - Key: Size
+          Value: !Ref size
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+# ── Outputs ────────────────────────────────────────────────────────────────────
+# Returned to Lambda after provisioning, then passed back through API Gateway
+# to MPP as the customer's access details.
+
+Outputs:
+
+  InstanceId:
+    Description: EC2 instance ID.
+    Value: !Ref WebServer
+
+  PrivateIP:
+    Description: Private IP address. Always reachable via VPN.
+    Value: !GetAtt WebServer.PrivateIp
+
+  PublicIP:
+    Description: Public IP address. Only available when AccessType = 2_public.
+    Value: !If
+      - IsPublicAccess
+      - !GetAtt WebServer.PublicIp
+      - "No public IP — connect via VPN using private IP"
+
+  PublicDNS:
+    Description: Public DNS hostname. Only relevant when AccessType = 2_public.
+    Value: !If
+      - IsPublicAccess
+      - !GetAtt WebServer.PublicDnsName
+      - "No public DNS — connect via VPN"
+
+  SSHCommand:
+    Condition: IsLinux
+    Description: >
+      Ready-to-use SSH command. ec2-user for Amazon Linux 2023, ubuntu for Ubuntu.
+      Uses the public IP for public access, private IP for internal (VPN) access.
+    Value: !Sub
+      - "ssh -i <your-private-key> ${SshUser}@${IP}"
+      - SshUser: !If [IsAL2023, "ec2-user", "ubuntu"]
+        IP: !If [IsPublicAccess, !GetAtt WebServer.PublicIp, !GetAtt WebServer.PrivateIp]
+
+  RDPEndpoint:
+    Condition: IsWindows
+    Description: IP address for RDP connection to Windows Server.
+    Value: !If
+      - IsPublicAccess
+      - !GetAtt WebServer.PublicIp
+      - !GetAtt WebServer.PrivateIp
+
+  Servername:
+    Description: Server hostname as set in MPP.
+    Value: !Ref servername
+
+  OS:
+    Description: Operating system deployed.
+    Value: !Ref OperatingSystem
+
+  Size:
+    Description: Server size deployed.
+    Value: !Ref size
+
+  StackName:
+    Description: CloudFormation stack name.
+    Value: !Ref AWS::StackName
 
