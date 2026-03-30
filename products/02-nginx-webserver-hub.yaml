@@ -40,7 +40,7 @@ Parameters:
 
   # ── From MPP order form ──────────────────────────────────────────────────────
 
-  servername:
+  ServerName:
     Type: String
     Description: >
       Hostname for the server. Used as the EC2 Name tag and set as the OS
@@ -54,19 +54,19 @@ Parameters:
     Type: String
     Description: Operating system to install.
     AllowedValues:
-      - 1_amazon_linux_2023
-      - 2_ubuntu_2404
-      - 3_windows_2022
-    Default: 1_amazon_linux_2023
+      - amazon-linux-2023
+      - ubuntu-24-04
+      - windows-2022
+    Default: amazon-linux-2023
 
-  size:
+  InstanceSize:
     Type: String
     Description: "Server size: S = t3.medium (2 vCPU / 4 GB), M = t3.xlarge (4 vCPU / 16 GB), L = t3.2xlarge (8 vCPU / 32 GB)."
     AllowedValues:
-      - 1-small
-      - 2-medium
-      - 3-large
-    Default: 1-small
+      - small
+      - medium
+      - large
+    Default: small
 
   DiskSizeGb:
     Type: Number
@@ -78,12 +78,12 @@ Parameters:
   AccessType:
     Type: String
     Description: >
-      Access type. 1_internal restricts SSH/RDP to the private VPN range (10.0.0.0/8).
-      2_public opens SSH/RDP to the IpWhitelist CIDR.
+      Access type. internal restricts SSH/RDP to the private VPN range (10.0.0.0/8).
+      public opens SSH/RDP to the IpWhitelist CIDR.
     AllowedValues:
-      - 1_internal
-      - 2_public
-    Default: 1_internal
+      - internal
+      - public
+    Default: internal
 
   IpWhitelist:
     Type: String
@@ -123,21 +123,21 @@ Parameters:
 
 Mappings:
   SizeConfig:
-    1-small:
+    small:
       InstanceType: t3.medium     # 2 vCPU, 4 GB RAM
-    2-medium:
+    medium:
       InstanceType: t3.xlarge     # 4 vCPU, 16 GB RAM
-    3-large:
+    large:
       InstanceType: t3.2xlarge    # 8 vCPU, 32 GB RAM
 
 # ── Conditions ─────────────────────────────────────────────────────────────────
 
 Conditions:
 
-  IsWindows:      !Equals [!Ref OperatingSystem, "3_windows_2022"]
-  IsLinux:        !Not [!Equals [!Ref OperatingSystem, "3_windows_2022"]]
-  IsAL2023:       !Equals [!Ref OperatingSystem, "1_amazon_linux_2023"]
-  IsPublicAccess: !Equals [!Ref AccessType, "2_public"]
+  IsWindows:      !Equals [!Ref OperatingSystem, "windows-2022"]
+  IsLinux:        !Not [!Equals [!Ref OperatingSystem, "windows-2022"]]
+  IsAL2023:       !Equals [!Ref OperatingSystem, "amazon-linux-2023"]
+  IsPublicAccess: !Equals [!Ref AccessType, "public"]
 
   HasSshKey:
     !Not [!Equals [!Ref SshPublicKey, ""]]
@@ -176,7 +176,7 @@ Resources:
   WebServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub Security group for ${servername} (${CustomerID})
+      GroupDescription: !Sub Security group for ${ServerName} (${CustomerID})
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -195,7 +195,7 @@ Resources:
           Description: All outbound traffic permitted
       Tags:
         - Key: Name
-          Value: !Sub diu-sg-${servername}
+          Value: !Sub diu-sg-${ServerName}
         - Key: Customer
           Value: !Ref CustomerID
         - Key: CostCenter
@@ -272,7 +272,7 @@ Resources:
   WebServer:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: !FindInMap [SizeConfig, !Ref size, InstanceType]
+      InstanceType: !FindInMap [SizeConfig, !Ref InstanceSize, InstanceType]
       ImageId: !If
         - IsAL2023
         - !Ref AmiAl2023
@@ -310,7 +310,7 @@ Resources:
                 - ""
                 - - "<powershell>\n"
                   - "Rename-Computer -NewName '"
-                  - !Ref servername
+                  - !Ref ServerName
                   - "' -Force -ErrorAction SilentlyContinue\n"
                   - "Install-WindowsFeature -Name Web-Server -IncludeManagementTools\n"
                   - "$html = '<!DOCTYPE html><html><head><title>DIU Managed Server</title></head>"
@@ -318,7 +318,7 @@ Resources:
                   - "<p>Customer: "
                   - !Ref CustomerID
                   - "</p><p>Server: "
-                  - !Ref servername
+                  - !Ref ServerName
                   - "</p><p>Environment: "
                   - !Ref Environment
                   - "</p></body></html>'\n"
@@ -338,7 +338,7 @@ Resources:
               set -euo pipefail
 
               # Set hostname
-              hostnamectl set-hostname ${servername}
+              hostnamectl set-hostname ${ServerName}
 
               # Install NGINX — AL2023 uses dnf, Ubuntu uses apt
               if command -v apt-get &>/dev/null; then
@@ -362,7 +362,7 @@ Resources:
                 <body>
                   <h1>DIU Managed Infrastructure</h1>
                   <p>Customer: ${CustomerID}</p>
-                  <p>Server: ${servername}</p>
+                  <p>Server: ${ServerName}</p>
                   <p>OS: ${OperatingSystem}</p>
                   <p>Environment: ${Environment}</p>
                 </body>
@@ -373,15 +373,15 @@ Resources:
               /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource WebServer || true
       Tags:
         - Key: Name
-          Value: !Ref servername
+          Value: !Ref ServerName
         - Key: Customer
           Value: !Ref CustomerID
         - Key: Servername
-          Value: !Ref servername
+          Value: !Ref ServerName
         - Key: OS
           Value: !Ref OperatingSystem
         - Key: Size
-          Value: !Ref size
+          Value: !Ref InstanceSize
         - Key: CostCenter
           Value: !Ref CostCenter
         - Key: Environment
@@ -437,7 +437,7 @@ Outputs:
 
   Servername:
     Description: Server hostname as set in MPP.
-    Value: !Ref servername
+    Value: !Ref ServerName
 
   OS:
     Description: Operating system deployed.
@@ -445,7 +445,7 @@ Outputs:
 
   Size:
     Description: Server size deployed.
-    Value: !Ref size
+    Value: !Ref InstanceSize
 
   StackName:
     Description: CloudFormation stack name.
