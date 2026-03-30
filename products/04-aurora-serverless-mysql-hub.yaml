@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DIU Managed Infrastructure Platform - Serverless MySQL Database (Aurora Serverless v2).
+  Deploys an Amazon Aurora Serverless v2 cluster (MySQL 8.0-compatible) into a pre-existing VPC.
+  Capacity scales automatically between MinCapacity and MaxCapacity in Aurora Capacity Units (ACU).
+  Network placement and cost-centre tagging are injected by the provisioning Lambda from SSM.
+
+# ── Parameters ─────────────────────────────────────────────────────────────────
+
+Parameters:
+
+  # ── Injected by Lambda from SSM ─────────────────────────────────────────────
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Pre-existing VPC. Injected by Lambda from SSM.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Primary private subnet. Injected by Lambda from SSM.
+
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Secondary private subnet in a different AZ. AWS requires at least two AZs for Aurora
+      subnet groups. Injected by Lambda from SSM
+      (/diu/customers/{customer_id}/private-subnet-id-2).
+
+  CustomerID:
+    Type: String
+    Description: Unique customer identifier. Used for naming and tagging.
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Lowercase letters, numbers, and hyphens only.
+
+  CostCenter:
+    Type: String
+    Description: Cost center code for billing attribution. Applied as a tag to all resources.
+    MinLength: 1
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, test, prod]
+    Description: Deployment environment.
+
+  # ── From MPP order form ──────────────────────────────────────────────────────
+  # NOTE: CloudFormation parameter names must be alphanumeric only (no underscores).
+  # MPP field names (min_capacity, max_capacity, auto_pause) are mapped to
+  # PascalCase equivalents here. The MPP integration layer must use these names
+  # as product_parameters keys when calling POST /provision.
+
+  DatabaseName:
+    Type: String
+    Description: >
+      Name of the initial database to create. Also used in the cluster Name tag.
+      Must begin with a letter. Letters, numbers, and underscores only.
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    ConstraintDescription: Must begin with a letter and contain only letters, numbers, and underscores.
+
+  MinCapacity:
+    Type: String
+    Description: >
+      Minimum Aurora Capacity Units (ACU). Maps to MPP field min_capacity.
+      The cluster scales down to this floor during low load.
+      0.5 ACU is the most cost-efficient minimum; use 1 or 2 ACU if cold-start latency is a concern.
+      Note: values use hyphens (e.g. 1-acu-05) — CloudFormation mapping keys do not allow underscores.
+    AllowedValues:
+      - 1-acu-05
+      - 2-acu-1
+      - 3-acu-2
+    Default: 1-acu-05
+
+  MaxCapacity:
+    Type: String
+    Description: >
+      Maximum Aurora Capacity Units (ACU). Maps to MPP field max_capacity.
+      The cluster will not scale above this ceiling.
+      Higher values allow more concurrent load but increase the maximum possible cost.
+      Note: values use hyphens (e.g. 1-acu-2) — CloudFormation mapping keys do not allow underscores.
+    AllowedValues:
+      - 1-acu-2
+      - 2-acu-4
+      - 3-acu-8
+    Default: 1-acu-2
+
+  AutoPause:
+    Type: String
+    Description: >
+      Maps to MPP field auto_pause.
+      NOTE: Auto-pause is a feature of Aurora Serverless v1, which is deprecated.
+      Aurora Serverless v2 does not support auto-pause — it scales down to MinCapacity
+      during low load instead of pausing completely. This parameter is accepted for MPP
+      form compatibility but has NO EFFECT on the deployed cluster.
+    AllowedValues:
+      - 1_pause_on
+      - 2_pause_off
+    Default: 2_pause_off
+
+  AccessType:
+    Type: String
+    Description: >
+      Access type. 1_internal restricts MySQL traffic to the private VPN range (10.0.0.0/8).
+      2_ip_whitelist opens MySQL traffic to the single CIDR specified in IpWhitelist.
+    AllowedValues:
+      - 1_internal
+      - 2_ip_whitelist
+    Default: 1_internal
+
+  IpWhitelist:
+    Type: String
+    Description: >
+      Single CIDR range allowed to reach MySQL port 3306. Required when AccessType = 2_ip_whitelist.
+      Must be a valid CIDR (e.g. 203.0.113.0/24). Leave empty for internal-only access.
+      Note: the MPP form accepts a comma-separated list, but this template supports one CIDR only.
+    Default: ""
+
+# ── Mappings ───────────────────────────────────────────────────────────────────
+# Translates MPP choice values to the numeric ACU values Aurora expects.
+
+Mappings:
+
+  MinCapacityMap:
+    1-acu-05:
+      Value: 0.5
+    2-acu-1:
+      Value: 1
+    3-acu-2:
+      Value: 2
+
+  MaxCapacityMap:
+    1-acu-2:
+      Value: 2
+    2-acu-4:
+      Value: 4
+    3-acu-8:
+      Value: 8
+
+# ── Conditions ─────────────────────────────────────────────────────────────────
+
+Conditions:
+  IsIpWhitelist: !Equals [!Ref AccessType, "2_ip_whitelist"]
+
+# ── Resources ──────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── Security Group ──────────────────────────────────────────────────────────
+  # Allows inbound MySQL on port 3306 from the configured CIDR.
+  # Intern: VPN range only (10.0.0.0/8). Whitelist: single caller-supplied CIDR.
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Aurora security group for ${CustomerID} (${DatabaseName})'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !If [IsIpWhitelist, !Ref IpWhitelist, "10.0.0.0/8"]
+          Description: !If
+            - IsIpWhitelist
+            - !Sub MySQL from ${IpWhitelist}
+            - MySQL from VPN (10.0.0.0/8)
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub diu-aurora-sg-${CustomerID}
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── DB Subnet Group ─────────────────────────────────────────────────────────
+  # Aurora requires subnets in at least 2 AZs.
+  # The cluster writer instance is placed in the primary private subnet (SubnetId).
+  # SubnetId2 exists only to satisfy the multi-AZ requirement for the subnet group.
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${CustomerID} Aurora cluster'
+      SubnetIds:
+        - !Ref SubnetId
+        - !Ref SubnetId2
+      Tags:
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Aurora Serverless v2 Cluster ────────────────────────────────────────────
+  # EngineMode: provisioned is correct for Serverless v2. The "serverless" engine
+  # mode is v1 only (deprecated). Serverless v2 behaviour is enabled by:
+  #   (a) ServerlessV2ScalingConfiguration on the cluster
+  #   (b) DBInstanceClass: db.serverless on the writer instance (see below)
+  #
+  # ManageMasterUserPassword: true — RDS auto-generates the master password and
+  # stores it in AWS Secrets Manager under a secret named rds!cluster-{uuid}.
+  # No password is passed as a parameter or stored in CloudFormation.
+  # The SecretArn output allows the caller to retrieve credentials from Secrets Manager.
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.12.0'
+      EngineMode: provisioned
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !FindInMap [MinCapacityMap, !Ref MinCapacity, Value]
+        MaxCapacity: !FindInMap [MaxCapacityMap, !Ref MaxCapacity, Value]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt DBSecurityGroup.GroupId
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'mon:04:00-mon:05:00'
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub diu-aurora-${CustomerID}-${DatabaseName}
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: DBName
+          Value: !Ref DatabaseName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Aurora Writer Instance ──────────────────────────────────────────────────
+  # Aurora Serverless v2 requires at least one DB instance in the cluster.
+  # DBInstanceClass: db.serverless activates Serverless v2 scaling.
+  # This is the writer instance — Aurora scales its capacity between
+  # MinCapacity and MaxCapacity ACU automatically based on load.
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Customer
+          Value: !Ref CustomerID
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+# ── Outputs ────────────────────────────────────────────────────────────────────
+# Returned to Lambda after provisioning, then passed back through API Gateway
+# to MPP as the customer's access details.
+
+Outputs:
+
+  ClusterEndpoint:
+    Description: Aurora cluster write endpoint. Use for all DML and DDL operations.
+    Value: !GetAtt DBCluster.Endpoint.Address
+
+  ReaderEndpoint:
+    Description: Aurora cluster reader endpoint. Route read-only queries here.
+    Value: !GetAtt DBCluster.ReadEndpoint.Address
+
+  DBPort:
+    Description: MySQL port (always 3306).
+    Value: !GetAtt DBCluster.Endpoint.Port
+
+  DBName:
+    Description: Name of the initial database.
+    Value: !Ref DatabaseName
+
+  ClusterIdentifier:
+    Description: Aurora cluster identifier (as shown in the RDS console).
+    Value: !Ref DBCluster
+
+  SecretArn:
+    Description: >
+      ARN of the Secrets Manager secret containing the master user credentials.
+      Retrieve with: aws secretsmanager get-secret-value --secret-id <SecretArn>
+    Value: !GetAtt DBCluster.MasterUserSecret.SecretArn
+
+  StackName:
+    Description: CloudFormation stack name.
+    Value: !Ref AWS::StackName
